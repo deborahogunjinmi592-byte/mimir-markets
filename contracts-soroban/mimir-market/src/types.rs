@@ -257,4 +257,7 @@ pub enum Error {
     AlreadyClaimedPayout = 34,
     ChallengersDidNotWin = 35,
     UnsupportedDecimals = 36,
+    /// Returned when a market creator candidate is a duplicate of an existing
+    /// active or open claim by the same address with identical context.
+    DuplicateMarketCreator = 37,
 }
