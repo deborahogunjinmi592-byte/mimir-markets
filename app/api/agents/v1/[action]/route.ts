@@ -8,6 +8,7 @@ import {
   getMarketContractId,
   isContractAddress,
   isMarketConfigured,
+  validateNetworkPassphrase,
 } from "@/lib/stellar";
 import { publishReasoning } from "@/lib/reasoning/publish";
 import {
@@ -68,6 +69,8 @@ function normalizeWallet(value: string): string {
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "cache-control": "no-store" } });
 }
+
+import { withRequestId } from "@/lib/api/errors";
 
 /** Convert a structured ApiErrorResult from lib/api/errors into a Response. */
 /** Map an authorizeAction() rejection to the typed agent API error envelope. */
@@ -225,14 +228,14 @@ async function handleAgentApiPost(
   context: { params: Promise<{ action: string }> },
 ): Promise<Response> {
   const { action: rawAction } = await context.params;
-  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action" } }, 404);
+  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action", requestId } }, 404);
   const action = rawAction as AgentApiAction;
   // Cap before parse: Content-Length is a cheap fail-closed gate; the body byte
   // check below still applies when the header is absent or wrong.
   const declared = Number(req.headers.get("content-length") ?? NaN);
   if (Number.isFinite(declared) && declared > MAX_SIGNED_REQUEST_PAYLOAD_BYTES) {
     return json({
-      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes` },
+      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes`, requestId },
     }, 413);
   }
   let raw: string;
@@ -504,11 +507,60 @@ async function handleAgentApiPost(
     const revoked = revokeAgent(agent, { requestedBy: agent.ownerWallet, reason: String(body.reason ?? "owner revoked") });
     if (!revoked.ok) return json({ error: { message: revoked.reason } }, 403);
     await saveAgent(revoked.agent); result = { agent: revoked.agent };
+  } else if (action === "fetchResearch") {
+    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
+    if (!gate.allowed) {
+      await audit(request, "rejected", gate.reason);
+      return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
+    }
+    const adapterId = typeof body.adapterId === "string" ? body.adapterId : "";
+    const url = typeof body.url === "string" ? body.url : "";
+    if (!url || !adapterId) {
+      return errorResponse(apiError("invalid_request", "url and adapterId are required"));
+    }
+    const fetchRes = await fetchWithAdapter(adapterId, { url, agentId: agent.agentId });
+    if (!fetchRes.ok) {
+      if (fetchRes.kind === "adapter") return errorResponse(apiError("invalid_request", fetchRes.detail));
+      let code: ApiErrorCode;
+      switch (fetchRes.kind) {
+        case "paused": code = "agent_paused"; break;
+        case "blocked": code = "forbidden"; break;
+        case "budget": code = "budget_exhausted"; break;
+        case "too_many_redirects":
+        case "redirect_loop":
+        case "invalid_redirect":
+        case "protocol_downgrade":
+        case "content_type":
+        case "too_large":
+        case "http_error":
+          code = "invalid_request"; break;
+        case "cancelled":
+        case "dependency_failure":
+        case "transport":
+          code = "upstream_unavailable"; break;
+      }
+      return errorResponse(apiError(code, fetchRes.detail));
+    }
+    result = {
+      ok: true,
+      url: fetchRes.url,
+      finalUrl: fetchRes.finalUrl,
+      status: fetchRes.status,
+      contentType: fetchRes.contentType,
+      body: fetchRes.body,
+      contentHash: fetchRes.contentHash,
+      capturedAt: fetchRes.capturedAt,
+      bytes: fetchRes.bytes,
+      fromCache: fetchRes.fromCache,
+      redirects: fetchRes.redirects,
+      redirectChain: fetchRes.redirectChain,
+      budget: budgetRemaining(agent.agentId),
+    };
   } else if (action === "publishReasoning") {
     const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
     if (!gate.allowed) {
       await audit(request, "rejected", gate.reason);
-      return errorResponse(actionVerdictToError(gate, "researcher"));
+      return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
     }
     result = await publishReasoning({ ...(body as any), agentId: agent.agentId });
   } else {

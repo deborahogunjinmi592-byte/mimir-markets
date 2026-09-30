@@ -2,11 +2,14 @@
   <img src="./mimir-logo-preview.png" alt="Mimir logo" width="160" />
 </p>
 
+
 <h1 align="center">Mimir</h1>
+
 
 <p align="center">
   <strong>An AI-settled claim market on <a href="https://developers.stellar.org">Stellar</a>. Stakes and agent payments in USDC, ledger fees in XLM.</strong>
 </p>
+
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0" /></a>
@@ -1121,6 +1124,7 @@ Every env var lives in `.env.example`. Quick reference:
 | `ORACLE_LLM_MODEL`                | optional                 | Optional model name override                                                       |
 | `ORACLE_LLM_THROTTLE_MS`          | oracle                   | Min delay between oracle LLM calls; default `8000`                                 |
 | `ORACLE_SETTLEMENT_DELAY_MS`      | oracle                   | Delay between multiple expired settlements in one poll; default `900000` (15 min)  |
+| `ORACLE_SETTLEMENT_TX_MAX_ATTEMPTS` / `_RETRY_BASE_MS` / `_RETRY_MAX_MS` | oracle | Bounded retries for dependency failures only; defaults `3` / `1000` / `15000` ms. Every attempt re-reads Soroban state |
 | `AUTO_CHALLENGE`                  | oracle (worker)          | `1` to enable Kelly auto-stake                                                     |
 | `CHALLENGE_STAKE_USDC`            | oracle (worker)          | Min stake per auto-challenge, in USDC (default 2)                                   |
 | `CHALLENGE_CONFIDENCE`            | oracle (worker)          | Min LLM confidence % to auto-stake (default 80)                                    |
@@ -1185,7 +1189,9 @@ Every env var lives in `.env.example`. Quick reference:
 | `npm run smoke:x402` / `:http`               | Payment-scheme smoke against live Testnet / a full HTTP round trip                 |
 | `npm run load:x402`                          | Offline load test: fixture verification + settle/replay limits                      |
 | `npm run load:rate-limit`                    | Offline load test: the API rate limiter under mixed traffic                         |
-| `npm run test:smoke`                         | Node-native smoke tests (API validation, XMTP, db-index, etc.)                     |
+| `npm run test:node`                          | Full Node test suite with a versioned compile cache and process isolation           |
+| `npm run test:node:coverage`                 | Full Node suite plus a fresh LCOV report at `coverage/node/node-tests.lcov`         |
+| `npm run test:smoke`                         | Backwards-compatible alias for the Node test runner                                |
 | `npm run test:research`                      | Research adapters, categories, SSRF guard, x402 discovery suites                   |
 | `npm run test:baskets`                       | Basket validation, virtual NAV and high-water fee suites                           |
 | `npm run test:squad`                         | Squad view and pool suites                                                         |
@@ -1197,6 +1203,33 @@ Every env var lives in `.env.example`. Quick reference:
 | `npx tsx scripts/check-claim.ts <id>`        | Print a claim's state and deadline                                                 |
 | `npm run rollback:rehearsal`                 | Dry-run the full deployment rollback against a deterministic fixture (no secrets needed, runs in CI) |
 | `npm run rollback:rehearsal:live`            | Same rehearsal against your local `.env.local` (does not touch the chain)          |
+
+### Node test workflow
+
+`npm run test:node` is the release-safe full Node suite. It discovers every
+`tests/node/*.test.ts` file, keeps Node's process-per-file isolation, and uses a
+compile-only cache under `.cache/node-tests`. The cache is keyed by Node,
+`package-lock.json`, `tsx`, and the runner; test outcomes are never cached. Use
+`npm run test:node -- --no-cache` to force a clean compilation or
+`-- --clear-cache` to remove the selected cache before a run.
+
+The child test environment is an explicit allowlist. It does not load
+`.env.local` or pass production seeds, RPC credentials, LLM keys, or other
+secrets. Database-backed tests remain skipped by default; use
+`npm run test:node -- --with-db` only with an isolated test database and local
+credentials. This workflow does not write to Stellar, Neon, or any deployment.
+
+`npm run test:node:coverage` runs the same complete suite with fresh spec and
+LCOV reporters. A passing run publishes `coverage/node/node-tests.lcov`; a
+failing run publishes `coverage/node/node-tests.failed.lcov` and exits nonzero.
+CI uploads the report on success or failure, including on a cache miss. The
+report contains source paths and coverage data, not environment values or test
+secrets. Neither `--test-isolation=none` nor result reruns are part of the
+release command.
+
+For a local cache reset, remove `.cache/node-tests`. A rollback is limited to
+reverting the runner, package scripts, and CI cache/artifact steps; it does not
+require a contract migration, chain action, or deployment rollback.
 
 ---
 
