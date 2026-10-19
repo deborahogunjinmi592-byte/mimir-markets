@@ -38,15 +38,19 @@ pub enum DataKey {
     Accrued(Address),
     /// Rematch parent link validation cache: (parent_id, child_id) -> RematchStatus
     RematchParent(u64, u64),
-    /// Per-creator index of claim ids, split into bounded pages.
+    /// Per-creator index of claim ids, split into bounded pages of
+    /// `CREATOR_CLAIMS_PAGE_SIZE` ids each.
     CreatorClaims(Address, u32),
-    CreatorClaimCount(Address),
 }
 
 /// Persistent entries are bumped to roughly 30 days of ledgers on touch so an
 /// open market cannot be archived out from under its participants.
 const BUMP_THRESHOLD: u32 = 120_960;
 const BUMP_EXTEND: u32 = 518_400;
+
+/// Number of claim ids stored per `CreatorClaims` page entry. Bounds the
+/// ledger-entry footprint of each append and read.
+pub const CREATOR_CLAIMS_PAGE_SIZE: u32 = 100;
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 
@@ -269,88 +273,84 @@ pub fn set_challengers(env: &Env, id: u64, list: &Vec<Challenger>) {
 }
 
 // ── Per-creator claim index ──────────────────────────────────────────────────
+//
+// Storage cost: each creator's claims are stored as a sequence of persistent
+// `Vec<u64>` pages keyed by `CreatorClaims(creator, page_index)`, holding up to
+// `CREATOR_CLAIMS_PAGE_SIZE` ids each. Appending one claim touches at most one
+// page entry (plus the claim row itself), so `create_claim` grows the footprint
+// by at most one entry per call. Reads extend the TTL of every page they touch.
 
-/// Maximum number of claim ids stored in a single `CreatorClaims` page entry.
-const CREATOR_PAGE_SIZE: u32 = 100;
-
-fn creator_page_key(creator: &Address, page: u32) -> DataKey {
-    DataKey::CreatorClaims(creator.clone(), page)
-}
-
-/// Total number of claims created by `creator`.
-pub fn creator_claim_count(env: &Env, creator: &Address) -> u64 {
-    let key = DataKey::CreatorClaimCount(creator.clone());
-    match env.storage().persistent().get::<_, u64>(&key) {
-        Some(count) => {
+fn creator_claims_page(env: &Env, creator: &Address, page: u32) -> Vec<u64> {
+    let key = DataKey::CreatorClaims(creator.clone(), page);
+    match env.storage().persistent().get::<_, Vec<u64>>(&key) {
+        Some(list) => {
             env.storage()
                 .persistent()
                 .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
-            count
+            list
         }
-        None => 0,
+        None => Vec::new(env),
     }
 }
 
-/// Append `id` to `creator`'s claim index. Writes at most one page entry.
-pub fn append_creator_claim(env: &Env, creator: &Address, id: u64) {
-    let count_key = DataKey::CreatorClaimCount(creator.clone());
-    let count = creator_claim_count(env, creator);
-    let page = (count / CREATOR_PAGE_SIZE as u64) as u32;
-    let page_key = creator_page_key(creator, page);
-
-    let mut list: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&page_key)
-        .unwrap_or_else(|| Vec::new(env));
-    list.push_back(id);
-    env.storage().persistent().set(&page_key, &list);
+fn set_creator_claims_page(env: &Env, creator: &Address, page: u32, list: &Vec<u64>) {
+    let key = DataKey::CreatorClaims(creator.clone(), page);
+    env.storage().persistent().set(&key, list);
     env.storage()
         .persistent()
-        .extend_ttl(&page_key, BUMP_THRESHOLD, BUMP_EXTEND);
-
-    let next = count + 1;
-    env.storage().persistent().set(&count_key, &next);
-    env.storage()
-        .persistent()
-        .extend_ttl(&count_key, BUMP_THRESHOLD, BUMP_EXTEND);
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
 }
 
-/// Return up to `limit` claim ids created by `creator` starting at `offset`,
-/// along with the total number of claims created by `creator`.
-///
+/// Append `claim_id` to the creator's index, filling pages in order.
+pub fn append_creator_claim(env: &Env, creator: &Address, claim_id: u64) {
+    let mut page = 0u32;
+    loop {
+        let mut list = creator_claims_page(env, creator, page);
+        if (list.len() as u32) < CREATOR_CLAIMS_PAGE_SIZE {
+            list.push_back(claim_id);
+            set_creator_claims_page(env, creator, page, &list);
+            return;
+        }
+        page += 1;
+    }
+}
+
+/// Return a page of the creator's claim ids starting at `offset`, up to `limit`
+/// entries, along with the total number of claims indexed for the creator.
 /// `limit = 0` is treated as "return all remaining entries from `offset`".
-pub fn creator_claims_page(env: &Env, creator: &Address, offset: u32, limit: u32) -> (Vec<u64>, u64) {
-    let total = creator_claim_count(env, creator);
-    let start = (offset as u64).min(total);
+///
+/// Never panics: if `offset` is beyond the end of the index the returned
+/// `Vec` is empty and `total` carries the actual index length.
+pub fn get_creator_claims(env: &Env, creator: &Address, offset: u32, limit: u32) -> (Vec<u64>, u32) {
+    let mut all: Vec<u64> = Vec::new(env);
+    let mut page = 0u32;
+    loop {
+        let list = creator_claims_page(env, creator, page);
+        let len = list.len() as u32;
+        if len == 0 {
+            break;
+        }
+        for i in 0..len {
+            all.push_back(list.get(i).unwrap());
+        }
+        if len < CREATOR_CLAIMS_PAGE_SIZE {
+            break;
+        }
+        page += 1;
+    }
+
+    let total = all.len();
+    let start = offset.min(total);
     let remaining = total - start;
     let take = if limit == 0 {
         remaining
     } else {
-        (limit as u64).min(remaining)
+        limit.min(remaining)
     };
 
     let mut items = Vec::new(env);
-    let mut i = start;
-    let end = start + take;
-    while i < end {
-        let page = (i / CREATOR_PAGE_SIZE as u64) as u32;
-        let page_key = creator_page_key(creator, page);
-        let list: Vec<u64> = match env.storage().persistent().get(&page_key) {
-            Some(list) => {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&page_key, BUMP_THRESHOLD, BUMP_EXTEND);
-                list
-            }
-            None => Vec::new(env),
-        };
-        let page_start = (page as u64) * CREATOR_PAGE_SIZE as u64;
-        let idx = (i - page_start) as u32;
-        if let Some(id) = list.get(idx) {
-            items.push_back(id);
-        }
-        i += 1;
+    for i in start..start + take {
+        items.push_back(all.get(i).unwrap());
     }
 
     (items, total)

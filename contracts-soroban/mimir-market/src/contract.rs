@@ -9,9 +9,9 @@ use crate::escrow;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy, MarketConfig,
-    PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict, WinnerSide,
-    MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy,
+    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
+    WinnerSide, MAX_BATCH_SIZE,
 };
 
 #[contract]
@@ -176,13 +176,11 @@ impl MimirMarket {
     /// Paginated list of claim ids created by `creator`, in creation order.
     ///
     /// Returns up to `limit` ids starting at `offset` (0-based) together with
-    /// the creator's total claim count. `limit = 0` returns all ids from
-    /// `offset` to the end of the index. An `offset` beyond the end yields an
-    /// empty id list with `total` set correctly.
+    /// `total`, the full number of claims the creator has created. `limit = 0`
+    /// returns every id from `offset` to the end. An `offset` beyond the end
+    /// yields an empty list with `total` set correctly.
     ///
-    /// Backed by a per-creator persistent index appended in `create_claim`, so
-    /// this read is O(page) rather than O(total claims). TTL is extended on
-    /// read like other views.
+    /// TTL of the touched index pages is extended on read, like other views.
     pub fn get_creator_claims(
         env: Env,
         creator: Address,

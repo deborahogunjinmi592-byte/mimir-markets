@@ -15,23 +15,23 @@ Coroban provides two relevant storage classes used by `mimir-squad`:
    - All instance entries share the contract instance's lifetime and TTL. When the contract instance TTL is extended, all instance keys are extended together.
    - Used in `mimir-squad` for singleton protocol configuration, global counters, and administrative state.
 
-2. **Persistent Storage (`env.storage().persistent()`**:
+2. **Persistent Storage (`env.storage().persistent()`)**:
    - Independent storage entries with individual lifetimes, keys, and TTL counters.
    - Entries that are not accessed or explicitly bumped will eventually expire and enter an archived state, requiring a restoration transaction before they can be read or written again.
-   - Used in `mimir-squad` for per-market state, participant deposits, claim flags, parked payouts, and per-creator claim indexes.
+   - Used in `mimir-squad` for per-market state, participant deposits, claim flags, parked payouts, and per-creator claim indices.
 
 ### TTL Configuration Constants
 
 Defined in `contracts-soroban/mimir-squad/src/storage.rs`:
 
 ```rust
-const BUMP_THRESHOLD: u32 = 120_960; // ~7 days at 5s per Stellar ledger
+const BUMP_THRESHOLD: u32 = 120_960; // ~1 day at 5s per Stellar ledger
 const BUMP_EXTEND: u32 = 518_400;    // ~30 days at 5s per Stellar ledger
 ```
 
 When `extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND)` is called on a persistent entry:
-- If the remaining TTL is less than `BUMP_THRESHOLD` (120,960 ledgers), Soroban extends the entry's TTL to `BUMP_EXTEND` (518,400 ledgers from the current ledger).
-- If the remaining TTL is already above `BUMP_THRESHOLD`, the call is a no-op.
+-  If the remaining TTL is less than `BUMP_THRESHOLD` (120,960 ledgers), Soroban extends the entry's TTL to `BUMP_EXTEND` (518,400 ledgers from the current ledger).
+-  If the remaining TTL is already above `BUMP_THRESHOLD`, the call is a no-op.
 
 ---
 
@@ -40,10 +40,10 @@ When `extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND)` is called on a persistent e
 Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir-squad/src/storage.rs:9-26`).
 
 | Key Variant | Storage Class | Value Type | TTL Extended? | Touching Functions & Entry Points |
-| :--- | :--- | :--- | :--- | :--- |
+| : --- | : --- | : --- | : --- | : --- |
 | `DataKey::Init` | Instance | `bool` | With instance | `is_initialized` (storage.rs:33), `mark_initialized` (storage.rs:37), `initialize` (contract.rs:17), `is_initialized` view (contract.rs:136) |
 | `DataKey::Usdc` | Instance | `Address` | With instance | `set_config` (storage.rs:60), `usdc` (storage.rs:48), `initialize` (contract.rs:17), `get_usdc` view (contract.rs:132), `escrow::*` (escrow.rs) |
-| `DataKey::Oracle` | Instance | `Address` | With instance | `set_config` (storage.rs:60), `set_oracle` (storage.rs:68), `oracle` (storage.rs:52), `initialize` (contract.rs:17), `execute_oracle` (contract.rs:151), `get_oracle` view (contract.rs:136) |
+| `DataKey::Oracle` | Instance | `Address` | With instance | `set_config` (storage.rs:60), `set_oracle` (storage.rs:68), `oracle` (storage.rs:52), `initializee` (contract.rs:17), `execute_oracle` (contract.rs:151), `get_oracle` view (contract.rs:136) |
 | `DataKey::FeeRecipient` | Instance | `Address` | With instance | `set_config` (storage.rs:60), `fee_recipient` (storage.rs:56), `initialize` (contract.rs:17), `claim_fees` (contract.rs:79), `get_fee_recipient` view (contract.rs:159) |
 | `DataKey::PendingOracle` | Instance | `PendingOracle` | With instance | `pending_oracle` (storage.rs:72), `set_pending_oracle` (storage.rs:76), `clear_pending_oracle` (storage.rs:80), `queue_oracle` (contract.rs:141), `cancel_oracle` (contract.rs:146), `execute_oracle` (contract.rs:151), `get_pending_oracle` view (contract.rs:155) |
 | `DataKey::MarketCount` | Instance | `u64` | With instance | `market_count` (storage.rs:86), `set_market_count` (storage.rs:93), `create_market` (contract.rs:26), `get_market_count` view (contract.rs:118) |
@@ -52,7 +52,8 @@ Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir
 | `DataKey::Deposit(u64, u32, Address)` | Persistent | `i128` | **Write only (`set_deposit`)**; **NEVER on read** | `deposit_of` (storage.rs:133), `set_deposit` (storage.rs:140), `deposit` (pool.rs:22), `withdraw_before_deadline` (pool.rs:72), `claim` (pool.rs:160), `preview_claim` (pool.rs:312), `get_deposit` view (contract.rs:101) |
 | `DataKey::Claimed(u64, u32, Address)` | Persistent | `bool` | **Write only (`mark_claimed`)**; **NEVER on read** | `has_claimed` (storage.rs:152), `mark_claimed` (storage.rs:158), `claim` (pool.rs:160), `has_claimed` view (contract.rs:105) |
 | `DataKey::Payout(u64, u32, Address)` | Persistent | `i128` | **Write only (`set_payout`)**; **NEVER on read** | `payout_of` (storage.rs:170), `set_payout` (storage.rs:177), `claim` (pool.rs:232), `claim_parked_payout` (contract.rs:86, pool.rs:254), `parked_payout` view (contract.rs:128) |
-| `DataKey::CreatorClaims(Address, u32)` | Persistent | `Vec<u64>` | **Yes (Read & Write)** | `append_creator_claim` (storage.rs:99), `get_creator_claims_page` (storage.rs:119), `create_claim` (contract.rs:42), `get_creator_claims` view (contract.rs:166) |
+| `DataKey::CreatorClaimCount(Address)` | Persistent | `u64` | **Yes (Read & Write)** | `creator_claim_count` (storage.rs), `set_creator_claim_count` (storage.rs), `create_claim` (contract.rs), `get_creator_claims` (contract.rs) |
+| `DataKey::CreatorClaimPage(Address, u32)` | Persistent | `Vec<u64>` | **Yes (Read & Write)** | `creator_claim_page` (storage.rs), `set_creator_claim_page` (storage.rs), `create_claim` (contract.rs), `get_creator_claims` (contract.rs) |
 
 ---
 
@@ -76,11 +77,11 @@ Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir
 - **`DataKey::Market(u64)`**:
   - Value: `Market` struct:
     ```rust
-    pubstruct Market {
+    pub struct Market {
         pub captain: Address,
         pub deadline: u64,
         pub fee_bps: u32,
-        pub result: u32,            // 0 (open), SIDE_A, SIDE_B, or RESULT_CANCELLED
+        pub result: u32,            // 0 (open), SIDE_A, SIDE_B, or RESULT_CANCELED
         pub resolved: bool,
         pub pool_a: i128,
         pub pool_b: i128,
@@ -126,12 +127,27 @@ Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir
 
 ### 7. Creator Claim Index (Persistent)
 
-- **`DataKey::CreatorClaims(creator, page)`**:
-  - Value: `Vec<u64>` of claim ids created by `creator`, in creation order.
-  - Paging: each page key holds at most `CREATOR_CLAIMS_PAGE_SIZE` (100) ids. Claim ids are appended to the last page until it is full, then a new page is started. Total count is derived from the page lengths (pages are contiguous from index 0).
-  - Writing: `storage::append_creator_claim` (`storage.rs:99`) is called from `create_claim` (`contract.rs:42`). It reads the current last page, pushes the new claim id, and writes the page back with TTL extension. When the last page is full, a new page entry is created. The footprint of `create_claim` grows by at most one persistent entry (the appended page) per created claim.
-  - Reading: `storage::get_creator_claims_paged` (`storage.rs:119`) reads the pages covering the requested `[offset, offset + limit)` range, extending TTL on each page it touches. Total is computed from page lengths without scanning claims.
-  - Storage cost: one persistent entry per 100 claims per creator, plus the claim ids themselves (16 bytes each). This is bounded and scales with the creator's own claim count, not total claims.
+The creator claim index lets clients enumerate a creator's claims without scanning every claim id. It is append-only and paginated so that `create_claim`'s footprint growth remains bounded.
+
+- **`DataKey::CreatorClaimCount(creator)`**:
+  - Value: `u64` (total number of claims indexed for this creator).
+  - Writing: `storage::set_creator_claim_count` extends TTL.
+  - Reading: `storage::creator_claim_count` extends TTL on read.
+
+- **`DataKey::CreatorClaimPage(creator, page_index)`**:
+  - Value: `Vec<u64>` of claim ids, at most `CREATOR_CLAIMS_PAGE_SIZE` (100) ids.
+  - Writing: `storage::set_creator_claim_page` extends TTL.
+  - Reading: `storage::creator_claim_page` extends TTL on read.
+  - @ppend policy: `create_claim` appends the new claim id to the last page (creating it if full/missing) and increments the counter. Only the tail page and the counter are written, so footprint growth per create is at most one new page entry (plus the counter update).
+
+- Public read `get_creator_claims(creator, offset, limit) -> (Vec<u64>, total)`:
+  - Returns the slice of claim ids starting at `offset` up to `limit` ids, along with the total count.
+  - Extends TTL on the counter and every page entry it touches, consistent with other read paths.
+  - Pagination boundaries are handled by mapping the global offset to page indices and slicing within pages.
+
+### Storage Cost of the Creator Index
+
+Each creator adds one persistent `CreatorClaimCount` entry and one `CreatorClaimPage` entry per 100 claims. Each create appends a single `u64` to the tail page, so the footprint of `create_claim` grows by at most one new page entry every 100 claims for that creator. The index is append-only; no deletion or compaction is performed.
 
 ---
 
@@ -146,7 +162,7 @@ Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir
   Neither `get_deposit` (contract.rs:101), `preview_claim` (contract.rs:109, pool.rs:312), nor `deposit_of` called during `claim` (pool.rs:184) calls `extend_ttl`.
 - **Failure Mode**:
   If 30 days pass without another deposit or partial withdrawal by that specific participant:
-  1. The `Deposit(id, side, who)` will expire and is archived by Soroban.
+  1. The `Deposit(id, side, who)`key expires and is archived by Soroban.
   2. When the user later calls `claim`, `storage::deposit_of` executes:
      ```rust
      // storage.rs:133-138
@@ -154,7 +170,7 @@ Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir
          env.storage()
              .persistent()
              .get(&DataKey::Deposit(id, side, who.clone()))
-             .unwrap_or_default(0)
+             .unwrap_or(0)
      }
      ```
   3. Soroban returns `None` for archived entries, falling back to `0`.
@@ -193,4 +209,4 @@ Every storage key is represented by the `DataKey` enum (`contracts-soroban/mimir
   1. The `Payout` key is archived.
   2. Queries via `parked_payout` view (`contract.rs:128`) call `storage::payout_of`, which does not extend TTL.
   3. Once archived, `storage::payout_of` returns `0` (`storage.rs:174`).
-  4. Subsequent calls to `claim_parked_payout` (`pool.rs:254`) read `amount = 0`, emit no transfer, and return `0`, effectively leaving the parked USDC stuck.
+  4. Subsequent calls to `claim_parked_payout` (`pool.rs:254`) read `amount = 0`, emit no transfer, and return `0`, effectively leaving the parked USDC stuck 
