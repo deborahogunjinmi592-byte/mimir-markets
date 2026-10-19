@@ -15,7 +15,16 @@ const CONSENT_KEY = "mimir.analytics.consent";
 
 export type ConsentState = "granted" | "denied" | "unset";
 
-// Browser "Do Not Track" / Global Privacy Control. Treated as a hard denial.
+// We keep the consent state in a module variable so the client can read it
+// without touching storage on every event, and so a storage failure does not
+// silently drop events after a grant.
+let consentCache: ConsentState | null = null;
+
+// Track whether the cache was hydrated from storage so we can distinguish a
+// default "unset" from an explicitly stored "unset".
+let consentHydrated = false;
+
+/** Browser "Do Not Track" / Global Privacy Control. Treated as a hard denial. */
 function browserOptOut(): boolean {
   if (typeof navigator === "undefined") return false;
   const nav = navigator as Navigator & { doNotTrack?: string; globalPrivacyControl?: boolean };
@@ -26,16 +35,21 @@ function browserOptOut(): boolean {
 
 export function getConsent(): ConsentState {
   if (browserOptOut()) return "denied";
+  if (consentHydrated && consentCache !== null) return consentCache;
   try {
     const stored = window.localStorage.getItem(CONSENT_KEY);
-    return stored === "granted" || stored === "denied" ? stored : "unset";
+    consentCache = stored === "granted" || stored === "denied" ? stored : "unset";
   } catch {
     // Private mode / blocked storage: no consent record means no tracking.
-    return "unset";
+    consentCache = "unset";
   }
+  consentHydrated = true;
+  return consentCache;
 }
 
 export function setConsent(state: Exclude<ConsentState, "unset">): void {
+  consentCache = state;
+  consentHydrated = true;
   try {
     window.localStorage.setItem(CONSENT_KEY, state);
   } catch {
