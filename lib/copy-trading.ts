@@ -1,15 +1,16 @@
-/**
+/*
  * Copy trading policy and deterministic execution gate.
  *
- * Every USDC figure that crosses a boundary here is atomic at **7 decimals**
+ * Every USDC figure that crosses a boundary here is atomic at * 7 decimals*
  * (`lib/usdc.ts`), not the 6 the EVM-era ERC-20 used. `maxRealizedLossAtomic` and
  * `realizedLossAtomic` are the two fields where that matters, because they are the
- * only ones supplied as atomic strings rather than derived from a display number
- * through `parseUsdcAtomic` — a 6-decimal value there reads as a tenth of the
- * intended limit and stops copying ten times too early.
+ * only ones supplied as atomic strings rather than derived from a display number through
+ * `parseUsdcAtomic` — a 6-decimal value there reads as a tenth of the intended limit and stops
+ * copying ten times too early.
  */
 
 import { sha256Hex } from "@/lib/content-hash";
+import { isPaused } from "@/lib/ops/flags";
 import { isAccountAddress, isContractAddress } from "@/lib/stellar";
 import { parseUsdcAtomic } from "@/lib/usdc";
 
@@ -67,19 +68,26 @@ export interface CopySignal {
   availableLiquidityUsdc: number;
   requiredLiquidityUsdc: number;
   sourceAttributionId: string;
+  /** Optional chain status for callers that have already fetched the live claim. */
+  marketState?: "open" | "active" | "resolved" | "cancelled";
 }
 
 export type CopySkipReason =
   | "global_paused" | "permission_revoked" | "permission_paused" | "permission_expired"
+  | "malformed_signal" | "malformed_context" | "signal_agent_mismatch"
   | "self_copy" | "copy_depth" | "cycle" | "duplicate_position" | "stale_signal"
-  | "market_full" | "liquidity_exhausted" | "category_blocked" | "mode_blocked"
+  | "market_cancelled" | "market_closed" | "market_full" | "liquidity_exhausted"
+  | "category_blocked" | "mode_blocked"
   | "confidence_below_floor" | "payout_below_floor" | "position_cap"
   | "daily_cap" | "weekly_cap" | "open_exposure_cap" | "spend_permission_mismatch"
   | "loss_limit" | "simulation_failed";
 
 export interface CopyExecutionContext {
   now: number;
+  /** Caller-side stop. MIMIR_PAUSE_COPY_EXECUTION is checked regardless of this. */
   globalPaused: boolean;
+  /** Env the incident switch is read from; defaults to process.env. */
+  env?: Record<string, string | undefined>;
   usage: CopyUsage;
   existingClaimIds: ReadonlySet<number>;
   ancestryAgentIds: readonly string[];
@@ -92,6 +100,90 @@ export interface CopyExecutionContext {
    * is the LEDGER SEQUENCE the simulation was run against.
    */
   simulation: { ok: boolean; blockNumber: bigint; reason?: string };
+}
+
+/**
+ * What the owner signs to grant (or re-grant) a copy permission.
+ *
+ * Bound to the action, a single-use nonce and a short expiry so a captured
+ * request body cannot be replayed, and so a grant signature can never be
+ * presented as a revocation or vice versa. The wallet is interpolated VERBATIM:
+ * a Stellar strkey is case-sensitive base32.
+ */
+export function copyGrantMessage(args: {
+  permissionId: string; ownerWallet: string; policyHash: string; nonce: string; expiresAt: number;
+}): string {
+  return [
+    "Mimir copy permission",
+    "action: grant",
+    `permission: ${args.permissionId}`,
+    `owner: ${args.ownerWallet}`,
+    `policyHash: ${args.policyHash}`,
+    `nonce: ${args.nonce}`,
+    `expiresAt: ${new Date(args.expiresAt).toISOString()}`,
+  ].join("\n");
+}
+
+/** What the owner signs to revoke a copy permission. See {@link copyGrantMessage}. */
+export function copyRevokeMessage(args: {
+  permissionId: string; ownerWallet: string; nonce: string; expiresAt: number;
+}): string {
+  return [
+    "Mimir revoke copy permission",
+    "action: revoke",
+    `permission: ${args.permissionId}`,
+    `owner: ${args.ownerWallet}`,
+    `nonce: ${args.nonce}`,
+    `expiresAt: ${new Date(args.expiresAt).toISOString()}`,
+  ].join("\n");
+}
+
+/**
+ * Summary of the revocation confirmation dialog.
+ *
+ * The dashboard must show this before asking the wallet to sign a revoke,
+ * because revoke is owner-signed and irreversible from the dashboard's point of
+ * view. The copy builder is pure so it can be unit-tested and so the copy
+ * stays in sync with the signed message builders above.
+ */
+export interface RevokeConfirmation {
+  title: string;
+  /** What stops once the revoke is signed. */
+  stops: readonly string[];
+  /** What does NOT stop and must be revoked separately. */
+  doesNotStop: readonly string[];
+  /** Link to the spend-permission explanation. */
+  spendPermissionHref: string;
+  /** Accessible label for the confirm button. */
+  confirmLabel: string;
+  /** Accessible label for the cancel button. */
+  cancelLabel: string;
+}
+
+/** The spend-permission explanation already used by the feedback helper. */
+export const STELLAR_SPEND_PERMISSION_HERF = "/settings/spend-permissions";
+
+/**
+ * Build the content of the revocation confirmation dialog.
+ *
+ * Pure and deterministic: the UI passes the result straight into the dialog,
+ * and the signature request is only issued after the user confirms.
+ */
+export function buildRevokeConfirmation(permission: Pick<CopyPermission, "permissionId">): RevokeConfirmation {
+  return {
+    title: "Revoke copy permission?",
+    stops: [
+      "Mimir will stop executing further copies for this permission.",
+      "Existing open positions are not closed by this revoke.",
+    ],
+    doesNotStop: [
+      "On-chain spend allowances are not revoked by this signature.",
+      "Revoke the spend permission separately to stop token transfers.",
+    ],
+    spendPermissionHref: STELLAR_SPEND_PERMISSION_HERF,
+    confirmLabel: "Revoke copy permission",
+    cancelLabel: "Cancel",
+  };
 }
 
 export function copyPolicyHash(input: Omit<CopyPermission, "signedPolicyHash">): string {
@@ -132,58 +224,89 @@ export function worstCaseCopySpend(permission: CopyPermission): { perPositionUsd
 
 export function evaluateCopy(permission: CopyPermission, signal: CopySignal, context: CopyExecutionContext):
   { allowed: true; stakeUsdc: number } | { allowed: false; reason: CopySkipReason } {
-  if (context.globalPaused) return { allowed: false, reason: "global_paused" };
+  // The switch is read here, not left to the caller: an executor that forgot to
+  // map it into `globalPaused` would otherwise keep copying through an incident.
+  if (context.globalPaused || isPaused("copy_execution", context.env)) return { allowed: false, reason: "global_paused" };
   if (permission.status === "revoked") return { allowed: false, reason: "permission_revoked" };
   if (permission.status === "paused") return { allowed: false, reason: "permission_paused" };
+  if (!Number.isSafeInteger(context.now) || !context.usage ||
+      typeof context.usage.usedTodayUsdc !== "number" ||
+      typeof context.usage.usedThisWeekUsdc !== "number" ||
+      typeof context.usage.openExposureUsdc !== "number" ||
+      !Number.isSafeInteger(context.usage.usedTodayUsdc * 10_000_000) ||
+      !Number.isSafeInteger(context.usage.usedThisWeekUsdc * 10_000_000) ||
+      !Number.isSafeInteger(context.usage.openExposureUsdc * 10_000_000) ||
+      typeof context.usage.realizedLossAtomic !== "string" ||
+      !/^(0|[1-9]\d*)$/.test(context.usage.realizedLossAtomic) ||
+      typeof context.onchainAllowanceAtomic !== "bigint" || context.onchainAllowanceAtomic < 0n ||
+      typeof context.existingClaimIds?.has !== "function" || !Array.isArray(context.ancestryAgentIds) ||
+      !context.ancestryAgentIds.every((id) => typeof id === "string") ||
+      typeof context.configuredUsdc !== "string" || typeof context.configuredSpender !== "string" ||
+      !context.simulation || typeof context.simulation.ok !== "boolean" ||
+      typeof context.simulation.blockNumber !== "bigint" || context.simulation.blockNumber < 0n) {
+    return { allowed: false, reason: "malformed_context" };
+  }
+  try {
+    parseUsdcAtomic(context.usage.usedTodayUsdc);
+    parseUsdcAtomic(context.usage.usedThisWeekUsdc);
+    parseUsdcAtomic(context.usage.openExposureUsdc);
+  } catch { return { allowed: false, reason: "malformed_context" }; }
   if (context.now >= permission.expiresAt) return { allowed: false, reason: "permission_expired" };
+  if (typeof signal.sourcePositionId !== "string" || !signal.sourcePositionId || signal.sourcePositionId.length > 128 ||
+      typeof signal.sourceAttributionId !== "string" || !signal.sourceAttributionId || signal.sourceAttributionId.length > 128 ||
+      typeof signal.signalAgentId !== "string" || !signal.signalAgentId ||
+      !Number.isSafeInteger(signal.claimId) || signal.claimId < 0 ||
+      !Number.isSafeInteger(signal.sourceDepth) || signal.sourceDepth < 0 ||
+      !Number.isSafeInteger(signal.deadline) ||
+      !Number.isSafeInteger(signal.remainingSlots) ||
+      !Number.isInteger(signal.confidenceBps) || signal.confidenceBps < 0 || signal.confidenceBps > 10_000 ||
+      !Number.isInteger(signal.payoutBps) || signal.payoutBps < 0 ||
+      typeof signal.category !== "string" || typeof signal.mode !== "string" ||
+      !signal.category || !signal.mode ||
+      !Number.isFinite(signal.stakeUsdc) || signal.stakeUsdc < 0 ||
+      !Number.isFinite(signal.availableLiquidityUsdc) || signal.availableLiquidityUsdc < 0 ||
+      !Number.isFinite(signal.requiredLiquidityUsdc) || signal.requiredLiquidityUsdc < 0 ||
+      (signal.marketState !== undefined && !["open", "active", "resolved", "cancelled"].includes(signal.marketState))) {
+    return { allowed: false, reason: "malformed_signal" };
+  }
+  try {
+    parseUsdcAtomic(signal.stakeUsdc);
+    parseUsdcAtomic(signal.availableLiquidityUsdc);
+    parseUsdcAtomic(signal.requiredLiquidityUsdc);
+  } catch { return { allowed: false, reason: "malformed_signal" }; }
   if (signal.signalAgentId === permission.executionAgentId) return { allowed: false, reason: "self_copy" };
+  if (signal.signalAgentId !== permission.signalAgentId) return { allowed: false, reason: "signal_agent_mismatch" };
+  if (signal.marketState === "cancelled") return { allowed: false, reason: "market_cancelled" };
+  if (signal.marketState === "resolved") return { allowed: false, reason: "market_closed" };
   if (signal.sourceDepth >= permission.depth) return { allowed: false, reason: "copy_depth" };
   if (context.ancestryAgentIds.map((id) => id.toLowerCase()).includes(permission.executionAgentId.toLowerCase())) {
     return { allowed: false, reason: "cycle" };
   }
   if (context.existingClaimIds.has(signal.claimId)) return { allowed: false, reason: "duplicate_position" };
-  if (signal.deadline <= context.now) return { allowed: false, reason: "stale_signal" };
+  if (context.now > signal.deadline) return { allowed: false, reason: "stale_signal" };
   if (signal.remainingSlots <= 0) return { allowed: false, reason: "market_full" };
-  if (parseUsdcAtomic(signal.requiredLiquidityUsdc) > parseUsdcAtomic(signal.availableLiquidityUsdc)) return { allowed: false, reason: "liquidity_exhausted" };
-  if (permission.allowedCategories.length && !permission.allowedCategories.includes(signal.category)) return { allowed: false, reason: "category_blocked" };
-  if (permission.allowedModes.length && !permission.allowedModes.includes(signal.mode)) return { allowed: false, reason: "mode_blocked" };
+  if (signal.availableLiquidityUsdc < signal.requiredLiquidityUsdc) {
+    return { allowed: false, reason: "liquidity_exhausted" };
+  }
+  if (!permission.allowedCategories.includes(signal.category)) return { allowed: false, reason: "category_blocked" };
+  if (!permission.allowedModes.includes(signal.mode)) return { allowed: false, reason: "mode_blocked" };
   if (signal.confidenceBps < permission.minConfidenceBps) return { allowed: false, reason: "confidence_below_floor" };
   if (signal.payoutBps < permission.minPayoutBps) return { allowed: false, reason: "payout_below_floor" };
-  const stake = signal.stakeUsdc;
-  const stakeAtomic = parseUsdcAtomic(stake);
-  if (stakeAtomic <= 0n || stakeAtomic > parseUsdcAtomic(permission.maxPerPositionUsdc)) return { allowed: false, reason: "position_cap" };
-  if (parseUsdcAtomic(context.usage.usedTodayUsdc) + stakeAtomic > parseUsdcAtomic(permission.dailyCapUsdc)) return { allowed: false, reason: "daily_cap" };
-  if (parseUsdcAtomic(context.usage.usedThisWeekUsdc) + stakeAtomic > parseUsdcAtomic(permission.weeklyCapUsdc)) return { allowed: false, reason: "weekly_cap" };
-  if (parseUsdcAtomic(context.usage.openExposureUsdc) + stakeAtomic > parseUsdcAtomic(permission.totalOpenExposureUsdc)) return { allowed: false, reason: "open_exposure_cap" };
-  if (parseAtomicString(context.usage.realizedLossAtomic) + stakeAtomic > parseAtomicString(permission.maxRealizedLossAtomic)) return { allowed: false, reason: "loss_limit" };
-  const spend = permission.spendPermission;
-  const requiredAtomic = stakeAtomic;
-  // Exact comparison: a Stellar contract id / account is case-sensitive base32,
-  // so the EVM `toLowerCase()` pairing here would never match a real address.
-  if (spend.token.trim() !== context.configuredUsdc.trim() ||
-      spend.spender.trim() !== context.configuredSpender.trim() ||
-      spend.allowanceAtomic < requiredAtomic || context.onchainAllowanceAtomic < requiredAtomic) {
+  if (signal.stakeUsdc > permission.maxPerPositionUsdc) return { allowed: false, reason: "position_cap" };
+  if (context.usage.usedTodayUsdc + signal.stakeUsdc > permission.dailyCapUsdc) return { allowed: false, reason: "daily_cap" };
+  if (context.usage.usedThisWeekUsdc + signal.stakeUsdc > permission.weeklyCapUsdc) return { allowed: false, reason: "weekly_cap" };
+  if (context.usage.openExposureUsdc + signal.stakeUsdc > permission.totalOpenExposureUsdc) {
+    return { allowed: false, reason: "open_exposure_cap" };
+  }
+  if (context.configuredUsdc !== permission.spendPermission.token ||
+      context.configuredSpender !== permission.spendPermission.spender ||
+      context.onchainAllowanceAtomic < permission.spendPermission.allowanceAtomic) {
     return { allowed: false, reason: "spend_permission_mismatch" };
   }
+  try {
+    const loss = parseAtomicString(context.usage.realizedLossAtomic) + parseUsdcAtomic(signal.stakeUsdc);
+    if (loss > parseAtomicString(permission.maxRealizedLossAtomic)) return { allowed: false, reason: "loss_limit" };
+  } catch { return { allowed: false, reason: "malformed_context" }; }
   if (!context.simulation.ok) return { allowed: false, reason: "simulation_failed" };
-  return { allowed: true, stakeUsdc: stake };
-}
-
-export interface CopyAuditRecord {
-  executionId: string;
-  permissionId: string;
-  sourcePositionId: string;
-  signalAgentId: string;
-  executionAgentId: string;
-  sourceAttributionId: string;
-  status: "executed" | "skipped" | "failed" | "expired";
-  /** Atomic USDC at 7 decimals. */
-  stakeAtomic: bigint;
-  /** Ledger sequence the pre-flight simulation ran against. */
-  simulationBlock: bigint;
-  txHash?: string;
-  platformFeeAtomic: bigint;
-  ownerFeeAtomic: bigint;
-  skipReason?: CopySkipReason;
-  createdAt: number;
+  return { allowed: true, stakeUsdc: signal.stakeUsdc };
 }
