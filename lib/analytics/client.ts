@@ -15,7 +15,7 @@ const CONSENT_KEY = "mimir.analytics.consent";
 
 export type ConsentState = "granted" | "denied" | "unset";
 
-/** Browser "Do Not Track" / Global Privacy Control. Treated as a hard denial. */
+// Browser "Do Not Track" / Global Privacy Control. Treated as a hard denial.
 function browserOptOut(): boolean {
   if (typeof navigator === "undefined") return false;
   const nav = navigator as Navigator & { doNotTrack?: string; globalPrivacyControl?: boolean };
