@@ -1,4 +1,4 @@
-/**
+/*
  * Contract-backed copy-trading execution permission bounds and feedback.
  *
  * The chain (Soroban USDC Stellar Asset Contract) is the source of truth for
@@ -10,7 +10,7 @@
  * - `ready` — active permission backed by sufficient on-chain allowance and balance
  * - `loading` — chain read or upstream permission fetch in flight
  * - `invalid` — policy bounds or addresses fail schema or contract constraints
- * - `stale` — cached on-chain state or policy snapshot has exceeded freshness TTH
+ * - `stale` — cached on-chain state or policy snapshot has exceeded freshness TTL
  * - `disconnected` — wallet is disconnected or does not match permission owner
  * - `dependency_failure` — Soroban RPC or index dependency error during verification
  * - `paused` — platform or permission execution paused by operational policy
@@ -81,7 +81,7 @@ export interface CopyPermissionFeedbackView {
   ownerWallet: string | null;
   executionAgentId: string | null;
   signalAgentId: string | null;
-  /** Money bounds in atomic USDC (7 decimals) */
+  /** Money bounds in atomic USDC (\7 decimals) */
   maxPerPositionAtomic: string | null;
   dailyCapAtomic: string | null;
   weeklyCapAtomic: string | null;
@@ -107,15 +107,6 @@ export interface CopyPermissionFeedbackView {
   minPayoutBps: number | null;
   expiresAt: number | null;
   createdAt?: number | null;
-}
-
-/**
- * Link to the spend-permission explanation used in the copy-permission
- * feedback and revoke confirmation dialog. Kept in one place so the
- * explanation does not drift between surfaces.
- */
-export function spendPermissionExplanationLink(): string {
-  return "/docs/spend-permissions";
 }
 
 function emptyFeedback(
@@ -349,11 +340,11 @@ export function buildCopyPermissionFeedback(
   } else if (!hasSufficientAllowance) {
     status = "invalid";
     detail = onchainAllowance === 0n
-      ? "On-chain USDC allowance is 0. Re-grant the spend permission to resume copying."
-      : `On-chain USDC allowance (${onchainAllowance.toString()} atomic) is below the per-position cap. Re-grant the spend permission.`;
+      ? "On-chain USDC allowance is zero; grant a spend allowance from the owner wallet before execution can proceed."
+      : "On-chain USDC allowance is insufficient for the configured max per-position bound.";
   } else if (!hasSufficientBalance) {
     status = "invalid";
-    detail = `Wallet USDC balance (${onchainBalance.toString()} atomic) is below the per-position cap.`;
+    detail = "On-chain USDC balance is insufficient for the configured max per-position bound.";
   }
 
   return {
@@ -368,8 +359,8 @@ export function buildCopyPermissionFeedback(
     dailyCapAtomic: dailyCapAtomic.toString(),
     weeklyCapAtomic: weeklyCapAtomic.toString(),
     totalOpenExposureAtomic: totalOpenExposureAtomic.toString(),
-    maxRealizedLossAtomic: p.maxRealizedLossAtomic,
-    signedAllowanceAtomic: signedAllowance.toString(),
+    maxRealizedLossAtomic: p.maxRealizedLossUsdc ? parseUsdcAtomic(p.maxRealizedLossUsdc).toString() : null,
+    signedAllowanceAtomic: signedAllowance ?? null,
     onchainAllowanceAtomic: onchainAllowance !== null ? onchainAllowance.toString() : null,
     onchainBalanceAtomic: onchainBalance !== null ? onchainBalance.toString() : null,
     remainingAllowanceAtomic: remaining.toString(),
@@ -377,15 +368,15 @@ export function buildCopyPermissionFeedback(
     hasSufficientBalance,
     isSpenderConfigured,
     isTokenConfigured,
-    isExpired,
-    isRevoked,
-    isPaused,
+    isExpired: false,
+    isRevoked: false,
+    isPaused: false,
     isStale,
-    allowedCategories: p.allowedCategories,
-    allowedModes: p.allowedModes,
-    minConfidenceBps: p.minConfidenceBps,
-    minPayoutBps: p.minPayoutBps,
-    expiresAt: p.expiresAt,
-    createdAt: null,
+    allowedCategories: p.allowedCategories ?? [],
+    allowedModes: p.allowedModes ?? [],
+    minConfidenceBps: p.minConfidenceBps ?? null,
+    minPayoutBps: p.minPayoutBps ?? null,
+    expiresAt: p.expiresAt ?? null,
+    createdAt: p.createdAt ?? null,
   };
 }

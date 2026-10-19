@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useId, useRef, useState } from "react";
+import React from "react";
 import { formatAtomicUsdc } from "@/lib/usdc";
 import type { CopyPermissionFeedbackView, CopyPermissionStatus } from "@/lib/copy-permission-feedback";
 import { ShieldAlert, ShieldCheck, Clock, AlertTriangle, Unlink, Activity, RefreshCw } from "lucide-react";
@@ -28,59 +28,69 @@ export function CopyPermissionCard({
 }) {
   const theme = STATUS_THEME[feedback.status] ?? STATUS_THEME.invalid;
   const Icon = theme.icon;
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const dialogRef = React.useRef<HTMLHTMLElement | null>(null);
+  const cancelRef = React.useRef<HTMLButtonElement | null>(null);
+  const triggerRef = React.useRef<HTMLButtonElement | null>(null);
 
-  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
-  const dialogTitleId = useId();
-  const dialogDescId = useId();
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeConfirm = React.useCallback(() => {
+    setConfirmOpen(false);
+    // Return focus to the trigger after the dialog unmounts.
+    window.setTimeout(() => triggerRef.current?.focus(), 0);
+  }, []);
 
-  const closeConfirm = () => {
-    setIsConfirmOpen(false);
-    triggerRef.current?.focus();
-  };
-
-  const confirmRevoke = () => {
+  const confirmRevoke = React.useCallback(() => {
     const permissionId = feedback.permissionId;
-    setIsConfirmOpen(false);
-    if (permissionId) onRevoke?.(permissionId);
-  };
+    setConfirmOpen(false);
+    if (permissionId){
+      onRevoke?.(permissionId);
+    }
+  }, [feedback.permissionId, onRevoke]);
 
-  useEffect(() => {
-    if (!isConfirmOpen) return;
+  // Focus trap + Escape handling for the confirmation dialog.
+  React.useEffect(() => {
+    if (!confirmOpen) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    cancelRef.current?.focus();
 
-    cancelButtonRef.current?.focus();
-
-    const handleKeyDown = (event: KeyboardEvent) => {
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         closeConfirm();
         return;
       }
-
-      if (event.key !== "Tab" || !dialogRef.current) return;
-
-      const focusable = dialogRef.current.querySelectorAll<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-      );
-      if (focusable.length === 0) return;
-
+      if (event.key !== "Tab") return;
+      const node = dialogRef.current;
+      if (!node) return;
+      const focusable = Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([-tabindex="-1"])',
+        ),
+      ).filter((el) => !el.hasAttribute("disabled") && el.getAttribute("aria-hidden") !== "true");
+      if (focusable.length === 0) {
+        event.preventDefault();
+        return;
+      }
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
+      const active = document.activeElement as HTMLElement | null;
+      if (event.shiftKey) {
+        if (active === first || !active || !node.contains(active)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !active || !node.contains(active)) {
         event.preventDefault();
         first.focus();
       }
     };
 
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [isConfirmOpen]);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [confirmOpen, closeConfirm]);
 
   return (
     <section
@@ -96,7 +106,7 @@ export function CopyPermissionCard({
             </span>
           </div>
           <p className="mt-0.5 text-xs text-pv-muted">
-            Follows <span className="font-mono text-pv-text">{feedback.signalAgentId ?? "—"}</span> via{" "}
+            Follows <span className="font-mono text-pv-text">{feedback.signalAgentId ?? "—"}</span> via,{" "}
             <span className="font-mono text-pv-text">{feedback.executionAgentId ?? "—"}</span>
           </p>
         </div>
@@ -106,7 +116,7 @@ export function CopyPermissionCard({
           aria-live="polite"
           className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-mono text-[10px] font-bold uppercase tracking-wider ${theme.tone}`}
         >
-          <Icon className="h-3 w-3 shrink-0" />
+          <Icon className="h-w-3 w-3 shrink-0" />
           <span>{theme.label}</span>
         </div>
       </header>
@@ -156,19 +166,17 @@ export function CopyPermissionCard({
           <button
             ref={triggerRef}
             type="button"
-            onClick={() => setIsConfirmOpen(true)}
+            onClick={() => setConfirmOpen(true)}
             disabled={isRevoking}
             className="rounded border border-pv-danger/40 bg-pv-danger/10 px-3 py-1.5 font-mono text-xs font-semibold text-pv-danger transition-colors hover:bg-pv-danger/20 disabled:opacity-50"
             aria-label={`Revoke copy permission ${feedback.permissionId}`}
-            aria-haspopup="dialog"
-            aria-expanded={isConfirmOpen}
           >
             {isRevoking ? "Revoking…" : "Revoke Permission"}
           </button>
         </div>
       )}
 
-      {isConfirmOpen && feedback.permissionId && (
+      {confirmOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
           onClick={(event) => {
@@ -177,39 +185,29 @@ export function CopyPermissionCard({
         >
           <div
             ref={dialogRef}
-            role="dialog"
+            role="alertdialog"
             aria-modal="true"
-            aria-labelledby={dialogTitleId}
-            aria-describedby={dialogDescId}
-            className="w-full max-w-md rounded-2xl border border-pv-ink/10 bg-pv-surface p-5 shadow-xl"
+            aria-labelledby="copy-revoke-title"
+            aria-describedby="copy-revoke-description"
+            className="w-full max-w-lg rounded-2xl border border-pv-ink/10 bg-pv-surface p-5 shadow-xl text-pv-text"
           >
-            <h2 id={dialogTitleId} className="text-sm font-semibold text-pv-text">
-              Revoke copy permission?
+            <h2 id="copy-revoke-title" className="text-base font-semibold">
+              Revoke copy permission
             </h2>
-            <div id={dialogDescId} className="mt-2 space-y-2 text-xs text-pv-muted">
+            <div id="copy-revoke-description" className="mt-3 space-y-3 text-sm text-pv-muted">
               <p>
-                This is an owner-signed action. Once confirmed, Mimir will stop executing further copies for this
-                permission.
+                This will stop Mimir from executing further copies for permission <span className="font-mono text-pv-text">{feedback.permissionId}</span>. You will be asked to sign the revocation with your wallet.
               </p>
-              <p>
-                <span className="font-medium text-pv-text">What stops:</span> new copy executions under this
-                permission.
-              </p>
-              <p>
-                <span className="font-medium text-pv-text">What does not:</span> on-chain spend allowances are not
-                revoked by this action. You must revoke spend allowances separately from your wallet.
-              </p>
-              <p>
-                See the spend-permission explanation in the copy permission feedback for details on revoking
-                allowances.
+              <p className="rounded-lg border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-amber-300">
+                <strong>It does not</strong> revoke on-chain spend allowances. To stop token spending entirely, revoke the spend permission separately — see the spend-permission explanation in the copy permission feedback guide.
               </p>
             </div>
-            <div className="mt-4 flex justify-end gap-2">
+            <div className="mt-5 flex justify-end gap-2">
               <button
-                ref={cancelButtonRef}
+                ref={cancelRef}
                 type="button"
                 onClick={closeConfirm}
-                className="rounded border border-pv-ink/10 bg-pv-surface2/40 px-3 py-1.5 font-mono text-xs font-semibold text-pv-text transition-colors hover:bg-pv-surface2/70"
+                className="rounded border border-pv-ink/10 bg-pv-surface2 px-3 py-1.5 font-mono text-xs font-semibold text-pv-text hover:bg-pv-surface2/80"
               >
                 Cancel
               </button>
@@ -219,7 +217,7 @@ export function CopyPermissionCard({
                 disabled={isRevoking}
                 className="rounded border border-pv-danger/40 bg-pv-danger/10 px-3 py-1.5 font-mono text-xs font-semibold text-pv-danger transition-colors hover:bg-pv-danger/20 disabled:opacity-50"
               >
-                {isRevoking ? "Revoking…" : "Confirm Revoke"}
+                {isRevoking ? "Revoking…" : "Confirm revoke"}
               </button>
             </div>
           </div>
