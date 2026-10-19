@@ -1,4 +1,4 @@
-"use client";
+"tuse client";
 
 /**
  * Browser side of analytics — a thin, dependency-free poster to
